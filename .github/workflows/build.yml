@@ -5,6 +5,9 @@ on:
   push:
     branches:
       - mp3-to-voice
+      
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -42,3 +45,16 @@ jobs:
           name: Telegram-MP3-Voice
           path: '**/build/outputs/apk/**/*.apk'
           if-no-files-found: error
+
+      - name: Prepare APK for Release
+        run: |
+          mkdir -p release
+          find . -type f -path '*/build/outputs/apk/**/*.apk' -exec cp {} release/app.apk \;
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "v1.0.${{ github.run_number }}"
+          name: "Telegram-MP3-Voice v1.0.${{ github.run_number }}"
+          files: release/app.apk
+          generate_release_notes: true

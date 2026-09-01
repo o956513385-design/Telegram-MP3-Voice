@@ -9,6 +9,8 @@
 #include "c_utils.h"
 #include "libavformat/avformat.h"
 #include "libavcodec/avcodec.h"
+#include "libswresample/swresample.h"
+
 
 typedef struct {
     int version;
@@ -1049,4 +1051,500 @@ JNIEXPORT jboolean Java_org_telegram_messenger_MediaController_joinOpusFiles(JNI
     (*env)->ReleaseStringUTFChars(env, file2, file2Str);
     (*env)->ReleaseStringUTFChars(env, dest, destStr);
     return result == 1;
+}
+
+static int convertMp3ToOpusFile(const char *inputPath, const char *outputPath) {
+    AVFormatContext *formatContext = NULL;
+    AVCodecContext *codecContext = NULL;
+    const AVCodec *codec = NULL;
+    AVPacket *packet = NULL;
+    AVFrame *frame = NULL;
+    SwrContext *swrContext = NULL;
+
+    uint8_t *convertedBuffer = NULL;
+
+    int audioStreamIndex = -1;
+    int result = 0;
+
+    /*
+     * Telegram voice messages use:
+     * 48000 Hz
+     * mono
+     * signed 16-bit PCM
+     */
+    const int outputSampleRate = 48000;
+    const int outputChannels = 1;
+    const enum AVSampleFormat outputFormat = AV_SAMPLE_FMT_S16;
+
+    int16_t pcmFrame[960];
+    int pcmSamples = 0;
+
+    if (!inputPath || !outputPath) {
+        LOGE("convertMp3ToOpusFile: invalid paths");
+        return 0;
+    }
+
+    if (avformat_open_input(&formatContext, inputPath, NULL, NULL) < 0) {
+        LOGE("convertMp3ToOpusFile: cannot open input: %s", inputPath);
+        goto cleanup;
+    }
+
+    if (avformat_find_stream_info(formatContext, NULL) < 0) {
+        LOGE("convertMp3ToOpusFile: cannot find stream info");
+        goto cleanup;
+    }
+
+    audioStreamIndex = av_find_best_stream(
+            formatContext,
+            AVMEDIA_TYPE_AUDIO,
+            -1,
+            -1,
+            &codec,
+            0
+    );
+
+    if (audioStreamIndex < 0 || !codec) {
+        LOGE("convertMp3ToOpusFile: audio stream not found");
+        goto cleanup;
+    }
+
+    codecContext = avcodec_alloc_context3(codec);
+
+    if (!codecContext) {
+        LOGE("convertMp3ToOpusFile: cannot allocate codec context");
+        goto cleanup;
+    }
+
+    if (avcodec_parameters_to_context(
+            codecContext,
+            formatContext->streams[audioStreamIndex]->codecpar) < 0) {
+        LOGE("convertMp3ToOpusFile: cannot copy codec parameters");
+        goto cleanup;
+    }
+
+    if (avcodec_open2(codecContext, codec, NULL) < 0) {
+        LOGE("convertMp3ToOpusFile: cannot open decoder");
+        goto cleanup;
+    }
+
+    /*
+     * Create resampler:
+     *
+     * input  = original MP3 audio format
+     * output = 48000 Hz / mono / S16
+     */
+    AVChannelLayout outputLayout;
+    av_channel_layout_default(&outputLayout, outputChannels);
+
+    if (swr_alloc_set_opts2(
+            &swrContext,
+            &outputLayout,
+            outputFormat,
+            outputSampleRate,
+            &codecContext->ch_layout,
+            codecContext->sample_fmt,
+            codecContext->sample_rate,
+            0,
+            NULL
+    ) < 0 || !swrContext) {
+        av_channel_layout_uninit(&outputLayout);
+        LOGE("convertMp3ToOpusFile: cannot create resampler");
+        goto cleanup;
+    }
+
+    av_channel_layout_uninit(&outputLayout);
+
+    if (swr_init(swrContext) < 0) {
+        LOGE("convertMp3ToOpusFile: cannot initialize resampler");
+        goto cleanup;
+    }
+
+    /*
+     * Use Telegram's existing OGG/Opus recorder.
+     */
+    if (!initRecorder(outputPath, outputSampleRate)) {
+        LOGE("convertMp3ToOpusFile: cannot initialize Opus recorder");
+        goto cleanup;
+    }
+
+    packet = av_packet_alloc();
+    frame = av_frame_alloc();
+
+    if (!packet || !frame) {
+        LOGE("convertMp3ToOpusFile: cannot allocate FFmpeg objects");
+        cleanupRecorder();
+        goto cleanup;
+    }
+
+    while (av_read_frame(formatContext, packet) >= 0) {
+
+        if (packet->stream_index != audioStreamIndex) {
+            av_packet_unref(packet);
+            continue;
+        }
+
+        int sendResult = avcodec_send_packet(codecContext, packet);
+
+        av_packet_unref(packet);
+
+        if (sendResult < 0) {
+            LOGE("convertMp3ToOpusFile: decoder send error");
+            cleanupRecorder();
+            goto cleanup;
+        }
+
+        while (1) {
+            int receiveResult = avcodec_receive_frame(codecContext, frame);
+
+            if (receiveResult == AVERROR(EAGAIN) ||
+                receiveResult == AVERROR_EOF) {
+                break;
+            }
+
+            if (receiveResult < 0) {
+                LOGE("convertMp3ToOpusFile: decoder receive error");
+                cleanupRecorder();
+                goto cleanup;
+            }
+
+            int maxOutputSamples = (int) av_rescale_rnd(
+                    swr_get_delay(swrContext, codecContext->sample_rate)
+                    + frame->nb_samples,
+                    outputSampleRate,
+                    codecContext->sample_rate,
+                    AV_ROUND_UP
+            );
+
+            if (maxOutputSamples <= 0) {
+                continue;
+            }
+
+            int requiredBytes = av_samples_get_buffer_size(
+                    NULL,
+                    outputChannels,
+                    maxOutputSamples,
+                    outputFormat,
+                    1
+            );
+
+            if (requiredBytes <= 0) {
+                LOGE("convertMp3ToOpusFile: invalid output buffer size");
+                cleanupRecorder();
+                goto cleanup;
+            }
+
+            uint8_t *newBuffer = realloc(convertedBuffer, requiredBytes);
+
+            if (!newBuffer) {
+                LOGE("convertMp3ToOpusFile: out of memory");
+                cleanupRecorder();
+                goto cleanup;
+            }
+
+            convertedBuffer = newBuffer;
+
+            uint8_t *outputPlanes[1] = {
+                    convertedBuffer
+            };
+
+            int convertedSamples = swr_convert(
+                    swrContext,
+                    outputPlanes,
+                    maxOutputSamples,
+                    (const uint8_t **) frame->extended_data,
+                    frame->nb_samples
+            );
+
+            if (convertedSamples < 0) {
+                LOGE("convertMp3ToOpusFile: resampling failed");
+                cleanupRecorder();
+                goto cleanup;
+            }
+
+            int16_t *samples = (int16_t *) convertedBuffer;
+
+            for (int i = 0; i < convertedSamples; i++) {
+
+                pcmFrame[pcmSamples++] = samples[i];
+
+                /*
+                 * writeFrame() expects one Opus frame.
+                 * frame_size in this recorder is normally 960 samples.
+                 */
+                if (pcmSamples == 960) {
+
+                    if (!writeFrame(
+                            (uint8_t *) pcmFrame,
+                            sizeof(pcmFrame),
+                            0
+                    )) {
+                        LOGE("convertMp3ToOpusFile: writeFrame failed");
+                        cleanupRecorder();
+                        goto cleanup;
+                    }
+
+                    pcmSamples = 0;
+                }
+            }
+        }
+    }
+
+    /*
+     * Flush the decoder.
+     */
+    if (avcodec_send_packet(codecContext, NULL) >= 0) {
+
+        while (1) {
+            int receiveResult = avcodec_receive_frame(codecContext, frame);
+
+            if (receiveResult == AVERROR(EAGAIN) ||
+                receiveResult == AVERROR_EOF) {
+                break;
+            }
+
+            if (receiveResult < 0) {
+                LOGE("convertMp3ToOpusFile: decoder flush failed");
+                cleanupRecorder();
+                goto cleanup;
+            }
+
+            int maxOutputSamples = (int) av_rescale_rnd(
+                    swr_get_delay(swrContext, codecContext->sample_rate)
+                    + frame->nb_samples,
+                    outputSampleRate,
+                    codecContext->sample_rate,
+                    AV_ROUND_UP
+            );
+
+            if (maxOutputSamples <= 0) {
+                continue;
+            }
+
+            int requiredBytes = av_samples_get_buffer_size(
+                    NULL,
+                    outputChannels,
+                    maxOutputSamples,
+                    outputFormat,
+                    1
+            );
+
+            uint8_t *newBuffer = realloc(convertedBuffer, requiredBytes);
+
+            if (!newBuffer) {
+                LOGE("convertMp3ToOpusFile: out of memory during flush");
+                cleanupRecorder();
+                goto cleanup;
+            }
+
+            convertedBuffer = newBuffer;
+
+            uint8_t *outputPlanes[1] = {
+                    convertedBuffer
+            };
+
+            int convertedSamples = swr_convert(
+                    swrContext,
+                    outputPlanes,
+                    maxOutputSamples,
+                    (const uint8_t **) frame->extended_data,
+                    frame->nb_samples
+            );
+
+            if (convertedSamples < 0) {
+                cleanupRecorder();
+                goto cleanup;
+            }
+
+            int16_t *samples = (int16_t *) convertedBuffer;
+
+            for (int i = 0; i < convertedSamples; i++) {
+
+                pcmFrame[pcmSamples++] = samples[i];
+
+                if (pcmSamples == 960) {
+
+                    if (!writeFrame(
+                            (uint8_t *) pcmFrame,
+                            sizeof(pcmFrame),
+                            0
+                    )) {
+                        cleanupRecorder();
+                        goto cleanup;
+                    }
+
+                    pcmSamples = 0;
+                }
+            }
+        }
+    }
+
+    /*
+     * Flush the resampler.
+     */
+    while (1) {
+
+        int maxOutputSamples = (int) av_rescale_rnd(
+                swr_get_delay(swrContext, codecContext->sample_rate),
+                outputSampleRate,
+                codecContext->sample_rate,
+                AV_ROUND_UP
+        );
+
+        if (maxOutputSamples <= 0) {
+            break;
+        }
+
+        int requiredBytes = av_samples_get_buffer_size(
+                NULL,
+                outputChannels,
+                maxOutputSamples,
+                outputFormat,
+                1
+        );
+
+        if (requiredBytes <= 0) {
+            break;
+        }
+
+        uint8_t *newBuffer = realloc(convertedBuffer, requiredBytes);
+
+        if (!newBuffer) {
+            LOGE("convertMp3ToOpusFile: resampler flush out of memory");
+            cleanupRecorder();
+            goto cleanup;
+        }
+
+        convertedBuffer = newBuffer;
+
+        uint8_t *outputPlanes[1] = {
+                convertedBuffer
+        };
+
+        int convertedSamples = swr_convert(
+                swrContext,
+                outputPlanes,
+                maxOutputSamples,
+                NULL,
+                0
+        );
+
+        if (convertedSamples <= 0) {
+            break;
+        }
+
+        int16_t *samples = (int16_t *) convertedBuffer;
+
+        for (int i = 0; i < convertedSamples; i++) {
+
+            pcmFrame[pcmSamples++] = samples[i];
+
+            if (pcmSamples == 960) {
+
+                if (!writeFrame(
+                        (uint8_t *) pcmFrame,
+                        sizeof(pcmFrame),
+                        0
+                )) {
+                    cleanupRecorder();
+                    goto cleanup;
+                }
+
+                pcmSamples = 0;
+            }
+        }
+    }
+
+    /*
+     * Write the final partial Opus frame.
+     * writeFrame() pads it automatically.
+     */
+    if (pcmSamples > 0) {
+
+        if (!writeFrame(
+                (uint8_t *) pcmFrame,
+                pcmSamples * sizeof(int16_t),
+                1
+        )) {
+            LOGE("convertMp3ToOpusFile: final frame failed");
+            cleanupRecorder();
+            goto cleanup;
+        }
+
+    } else {
+        /*
+         * Empty or exact-multiple file:
+         * still finalize the OGG stream.
+         */
+        if (!writeFrame(NULL, 0, 1)) {
+            LOGE("convertMp3ToOpusFile: finalization failed");
+            cleanupRecorder();
+            goto cleanup;
+        }
+    }
+
+    cleanupRecorder();
+
+    result = 1;
+
+cleanup:
+
+    if (convertedBuffer) {
+        free(convertedBuffer);
+    }
+
+    if (packet) {
+        av_packet_free(&packet);
+    }
+
+    if (frame) {
+        av_frame_free(&frame);
+    }
+
+    if (swrContext) {
+        swr_free(&swrContext);
+    }
+
+    if (codecContext) {
+        avcodec_free_context(&codecContext);
+    }
+
+    if (formatContext) {
+        avformat_close_input(&formatContext);
+    }
+
+    return result;
+}
+
+
+JNIEXPORT jboolean JNICALL
+Java_org_telegram_messenger_MediaController_convertMp3ToOpus(
+        JNIEnv *env,
+        jclass clazz,
+        jstring source,
+        jstring destination
+) {
+    const char *sourcePath =
+            (*env)->GetStringUTFChars(env, source, NULL);
+
+    const char *destinationPath =
+            (*env)->GetStringUTFChars(env, destination, NULL);
+
+    int result = convertMp3ToOpusFile(
+            sourcePath,
+            destinationPath
+    );
+
+    (*env)->ReleaseStringUTFChars(
+            env,
+            source,
+            sourcePath
+    );
+
+    (*env)->ReleaseStringUTFChars(
+            env,
+            destination,
+            destinationPath
+    );
+
+    return result ? JNI_TRUE : JNI_FALSE;
 }

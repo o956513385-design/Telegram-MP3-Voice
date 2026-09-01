@@ -4748,7 +4748,7 @@ public class ChatActivityEnterView extends FrameLayout implements
             return false;
         }
 
-        if (isStories || (messageEditText == null || TextUtils.isEmpty(messageEditText.getText())) && parentFragment != null && parentFragment.messagePreviewParams != null && parentFragment.messagePreviewParams.forwardMessages != null && parentFragment.messagePreviewParams.forwardMessages.messages != null && !parentFragment.messagePreviewParams.forwardMessages.messages.isEmpty()) {
+        if (audioToSend != null || isStories || (messageEditText == null || TextUtils.isEmpty(messageEditText.getText())) && parentFragment != null && parentFragment.messagePreviewParams != null && parentFragment.messagePreviewParams.forwardMessages != null && parentFragment.messagePreviewParams.forwardMessages.messages != null && !parentFragment.messagePreviewParams.forwardMessages.messages.isEmpty()) {
 
             boolean self = parentFragment != null && UserObject.isUserSelf(parentFragment.getCurrentUser());
 
@@ -4814,6 +4814,95 @@ public class ChatActivityEnterView extends FrameLayout implements
                         });
                         sendPopupLayout.addView(sendWhenOnlineButton, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, DEFAULT_HEIGHT));
                     }
+                }
+                if (audioToSend != null) {
+    ActionBarMenuSubItem sendAsVoiceButton = new ActionBarMenuSubItem(
+            getContext(),
+            !scheduleButtonValue,
+            true,
+            resourcesProvider
+    );
+
+    sendAsVoiceButton.setTextAndIcon(
+            "Отправить как голосовое сообщение",
+            R.drawable.input_message
+    );
+
+    sendAsVoiceButton.setMinimumWidth(dp(196));
+
+    sendAsVoiceButton.setOnClickListener(v -> {
+        if (sendPopupWindow != null && sendPopupWindow.isShowing()) {
+            sendPopupWindow.dismiss();
+        }
+
+        if (audioToSendPath == null || audioToSend == null) {
+            return;
+        }
+
+        final String sourcePath = audioToSendPath;
+        final String destinationPath = sourcePath + ".voice.ogg";
+
+        new Thread(() -> {
+            try {
+                boolean success = MediaController.convertMp3ToOpus(
+                        sourcePath,
+                        destinationPath
+                );
+
+                AndroidUtilities.runOnUIThread(() -> {
+                    if (!success || !new File(destinationPath).exists()) {
+                        FileLog.e("MP3 to voice conversion failed");
+                        return;
+                    }
+
+                    try {
+                        new File(sourcePath).delete();
+                    } catch (Exception e) {
+                        FileLog.e(e);
+                    }
+
+                    audioToSendPath = destinationPath;
+
+                    audioToSend.mime_type = "audio/ogg";
+                    audioToSend.file_name = "voice.ogg";
+
+                    for (int i = 0; i < audioToSend.attributes.size(); i++) {
+                        TLRPC.DocumentAttribute attribute = audioToSend.attributes.get(i);
+
+                        if (attribute instanceof TLRPC.TL_documentAttributeAudio) {
+                            TLRPC.TL_documentAttributeAudio audioAttribute =
+                                    (TLRPC.TL_documentAttributeAudio) attribute;
+
+                            audioAttribute.voice = true;
+                            audioAttribute.title = "";
+                            audioAttribute.performer = "";
+                            audioAttribute.waveform =
+                                    MediaController.getWaveform(audioToSendPath);
+
+                            break;
+                        }
+                    }
+
+                    sendMessageInternal(true, 0, 0, 0, true);
+                });
+
+            } catch (Exception e) {
+                FileLog.e(e);
+
+                AndroidUtilities.runOnUIThread(() ->
+                        FileLog.e("MP3 to voice conversion exception")
+                );
+            }
+        }).start();
+    });
+
+    sendPopupLayout.addView(
+            sendAsVoiceButton,
+            LayoutHelper.createLinear(
+                    LayoutHelper.MATCH_PARENT,
+                    DEFAULT_HEIGHT
+            )
+    );
                 }
                 if (sendWithoutSoundButtonValue) {
                     ActionBarMenuSubItem sendWithoutSoundButton = new ActionBarMenuSubItem(getContext(), !scheduleButtonValue, true, resourcesProvider);

@@ -20,6 +20,16 @@ import java.net.URL;
 
 public class UpdateManager {
 
+    public static void checkForUpdates(Activity activity) {
+        if (activity == null || activity.isFinishing() || activity.isDestroyed()) {
+            return;
+        }
+
+        checkForUpdatesInternal(activity);
+    }
+
+    // здесь дальше уже твой существующий код
+
     private static final String RELEASE_API =
             "https://api.github.com/repos/o956513385-design/Telegram-MP3-Voice/releases/latest";
 

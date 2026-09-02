@@ -1,4 +1,4 @@
-```java
+
 package org.telegram.messenger;
 
 import android.app.Activity;
@@ -339,4 +339,4 @@ public class UpdateManager {
         }
     }
 }
-```
+

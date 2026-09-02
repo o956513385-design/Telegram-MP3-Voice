@@ -606,9 +606,9 @@ public class ApplicationLoader extends Application {
         applicationLoaderInstance.startAppCenterInternal(context);
     }
 
-    public static void checkForUpdates() {
-        applicationLoaderInstance.checkForUpdatesInternal();
-    }
+    public static void checkForUpdates(Activity activity) {
+        applicationLoaderInstance.checkForUpdatesInternal(activity);
+}
 
     public static void appCenterLog(Throwable e) {
         applicationLoaderInstance.appCenterLogInternal(e);
@@ -618,9 +618,13 @@ public class ApplicationLoader extends Application {
 
     }
 
-    protected void checkForUpdatesInternal() {
-
+    protected void checkForUpdatesInternal(Activity activity) {
+       if (activity == null || activity.isFinishing() || activity.isDestroyed()) {
+        return;
     }
+
+     UpdateManager.checkForUpdates(activity);
+}
 
     protected void startAppCenterInternal(Activity context) {
 

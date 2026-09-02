@@ -21,12 +21,27 @@ import java.net.URL;
 public class UpdateManager {
 
     public static void checkForUpdates(Activity activity) {
-        if (activity == null || activity.isFinishing() || activity.isDestroyed()) {
-            return;
+    if (activity == null || activity.isFinishing() || activity.isDestroyed()) {
+        return;
+    }
+
+    check(activity, new UpdateCallback() {
+        @Override
+        public void onUpdateAvailable(String version, String downloadUrl) {
+            // обновление найдено
         }
 
-        checkForUpdatesInternal(activity);
-    }
+        @Override
+        public void onNoUpdate() {
+            // обновление не найдено
+        }
+
+        @Override
+        public void onError(Exception e) {
+            // ошибка проверки
+        }
+    });
+}
 
     // здесь дальше уже твой существующий код
 

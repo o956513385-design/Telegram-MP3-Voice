@@ -607,7 +607,26 @@ public class ApplicationLoader extends Application {
     }
 
     public static void checkForUpdates(Activity activity) {
-        applicationLoaderInstance.checkForUpdatesInternal(activity);
+    if (activity == null || activity.isFinishing() || activity.isDestroyed()) {
+        return;
+    }
+
+    UpdateManager.check(activity, new UpdateManager.UpdateCallback() {
+        @Override
+        public void onUpdateAvailable(String version, String downloadUrl) {
+            // пока ничего не делаем
+        }
+
+        @Override
+        public void onNoUpdate() {
+            // обновление не найдено
+        }
+
+        @Override
+        public void onError(Exception e) {
+            // ошибка проверки обновления
+        }
+    });
 }
 
     public static void appCenterLog(Throwable e) {
